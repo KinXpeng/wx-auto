@@ -377,19 +377,61 @@ class WeChatAutoReplyApp:
             return
         self._picking = True
         self.set_status("正在读取会话…")
+        self._show_loading("正在加载会话列表…\n首次或数据库有更新时需要解密，请稍候")
         threading.Thread(target=self._pick_worker, daemon=True).start()
 
     def _pick_worker(self):
         """后台加载会话列表，避免界面卡顿。"""
         try:
             rows = self._load_session_rows()
-            self.root.after(0, lambda rows=rows: self._show_pick_dialog(rows))
+            self.root.after(0, lambda rows=rows: self._pick_finish(rows, None))
         except Exception as e:
             self.log(f"选择会话失败：{e}\n{traceback.format_exc()}")
-            self.root.after(0, lambda e=e: messagebox.showerror("错误", str(e)))
-        finally:
-            self._picking = False
-            self.root.after(0, lambda: self.set_status("运行中" if self.running else "未运行"))
+            self.root.after(0, lambda e=e: self._pick_finish(None, e))
+
+    def _pick_finish(self, rows, err):
+        """回到主线程：关闭加载窗并展示结果。"""
+        self._close_loading()
+        self._picking = False
+        self.set_status("运行中" if self.running else "未运行")
+        if err is not None:
+            messagebox.showerror("错误", str(err))
+            return
+        if not rows:
+            messagebox.showinfo("提示", "会话列表为空")
+            return
+        self._show_pick_dialog(rows)
+
+    def _show_loading(self, text: str):
+        """弹一个明显的加载提示窗（居中于主窗口）。"""
+        self._loading_win = None
+        try:
+            win = tk.Toplevel(self.root)
+            win.title("加载中")
+            win.transient(self.root)
+            win.attributes("-topmost", True)
+            win.resizable(False, False)
+            x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - 320) // 2)
+            y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - 100) // 2)
+            win.geometry(f"+{x}+{y}")
+            ttk.Label(win, text=text, justify="center", padding=(24, 16)).pack()
+            win.grab_set()
+            self._loading_win = win
+        except Exception:
+            self._loading_win = None
+
+    def _close_loading(self):
+        win = getattr(self, "_loading_win", None)
+        if win is not None:
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._loading_win = None
 
     def _load_session_rows(self):
         if self.db is None:
@@ -397,12 +439,14 @@ class WeChatAutoReplyApp:
         with self._db_lock:
             db = self.db
             sessions = db.get_sessions(limit=80) or []
+            usernames = [s.get("username") or "" for s in sessions]
+            name_map = self._resolve_display_names(db, usernames)
             rows = []
             for s in sessions:
                 username = s.get("username") or ""
                 if not username or username in ("brandsessionholder", "officialaccounts"):
                     continue
-                title = self.display_name_of(username)
+                title = name_map.get(username) or username
                 unread = s.get("unread") or 0
                 label = f"{title}    [{username}]"
                 if unread:
@@ -410,11 +454,29 @@ class WeChatAutoReplyApp:
                 rows.append((label, title, username))
         return rows
 
-    def _show_pick_dialog(self, rows: list):
-        if not rows:
-            messagebox.showinfo("提示", "会话列表为空")
-            return
+    def _resolve_display_names(self, db, usernames: list) -> dict:
+        """一次性查 contact.db 批量解析展示名（比逐个 get_nickname 快很多）。"""
+        names: dict = {}
+        unames = list(dict.fromkeys(u for u in usernames if u))
+        if not unames:
+            return names
+        conn = db._contact_conn()
+        if not conn:
+            return names
+        try:
+            ph = ",".join("?" * len(unames))
+            rows = conn.execute(
+                "SELECT username, nick_name, remark FROM contact "
+                f"WHERE username IN ({ph})",
+                unames,
+            ).fetchall()
+            for u, n, r in rows:
+                names[u] = r or n or u
+        finally:
+            conn.close()
+        return names
 
+    def _show_pick_dialog(self, rows: list):
         win = tk.Toplevel(self.root)
         win.title("选择会话")
         win.geometry("520x460")

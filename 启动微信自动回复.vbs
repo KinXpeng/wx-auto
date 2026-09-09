@@ -10,7 +10,7 @@ py = root & "\.venv\Scripts\python.exe"
 pyw = root & "\.venv\Scripts\pythonw.exe"
 
 If Not fso.FileExists(script) Then
-  MsgBox "wechat_auto_reply.py not found in:" & vbCrLf & root, 16, "WeChatAutoReply"
+  MsgBox "wechat_auto_reply.py not found in:" & vbCrLf & root, 16, "wx-auto"
   WScript.Quit 1
 End If
 
@@ -23,12 +23,12 @@ End If
 If rc <> 0 Then
   setup = root & "\install_dependencies.bat"
   If Not fso.FileExists(setup) Then
-    MsgBox "install_dependencies.bat not found in:" & vbCrLf & root, 16, "WeChatAutoReply"
+    MsgBox "install_dependencies.bat not found in:" & vbCrLf & root, 16, "wx-auto"
     WScript.Quit 1
   End If
   rc = shell.Run("cmd /c " & quote & quote & setup & quote, 1, True)
   If rc <> 0 Then
-    MsgBox "Dependency installation failed. Run install_dependencies.bat manually for details.", 16, "WeChatAutoReply"
+    MsgBox "Dependency installation failed. Run install_dependencies.bat manually for details.", 16, "wx-auto"
     WScript.Quit 1
   End If
 End If

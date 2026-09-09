@@ -33,7 +33,7 @@
 
 五、打包成 EXE
 1. 双击「scripts\build_exe.bat」
-2. 完成后在「dist\WeChatAutoReply.exe」生成单文件版本
+2. 完成后在「dist\wx-auto.exe」生成单文件版本
 3. 配置会保存在 EXE 同目录的「config.json」
 
 六、依赖安装
