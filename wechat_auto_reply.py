@@ -234,9 +234,16 @@ class WeChatAutoReplyApp:
             raise RuntimeError(f"在目录中未找到微信账号数据：{db_dir}")
         self.db = WeChatDB(db_dir=db_dir)
         info = self.db.get_self_info() or {}
-        self._self_wxid = info.get("username") or ""
-        nick = info.get("nick_name") or ""
+        self._self_wxid = (
+            info.get("username")
+            or info.get("userName")
+            or info.get("wxid")
+            or info.get("alias")
+            or ""
+        )
+        nick = info.get("nick_name") or info.get("nickName") or ""
         self.log(f"已连接消息库：{db_dir}；当前账号：{nick or self._self_wxid}")
+        self.log(f"当前账号 wxid：{self._self_wxid or '未获取到（自己消息过滤会失效）'}")
         return self.db
 
     def _collect_new_messages(self, user: str, since_seq: int):
@@ -503,17 +510,29 @@ class WeChatAutoReplyApp:
             return
         try:
             mtype = str(msg.get("type") or "")
-            if mtype and mtype not in ("文本", "text", "Text", "1"):
-                return
-
             sender = msg.get("sender_username") or ""
-            is_self = bool(self._self_wxid and sender == self._self_wxid)
-            if is_self and not self.reply_self_var.get():
+
+            # 判断是否为本人发送
+            is_self = bool(self._self_wxid and sender and sender == self._self_wxid)
+            if not is_self:
+                if any(msg.get(k) for k in ("is_sender", "isSelf", "isself", "IsSender") if k in msg):
+                    is_self = True
+
+            # 多媒体消息 content 不可靠，直接跳过
+            if mtype in ("image", "Image", "图片", "voice", "Voice", "语音", "video", "Video", "视频", "emoji", "Emoji", "表情"):
                 return
 
             content = normalize_text_content(str(msg.get("content") or ""))
             if not content:
                 return
+
+            if is_self and not self.reply_self_var.get():
+                self.log(f"忽略自己消息：{content[:40]}（sender={sender}, self={self._self_wxid}）")
+                return
+
+            # 非文本/应用消息但带文本内容时，记录一下以便排查
+            if mtype and mtype not in ("文本", "text", "Text", "1", "appmsg", "App", "49"):
+                self.log(f"收到非文本消息 type={mtype} sender={sender} content={content[:60]!r}")
 
             reply = self.reply_text.get("1.0", tk.END).strip()
             reply_norm = normalize_text_content(reply)
@@ -527,6 +546,8 @@ class WeChatAutoReplyApp:
             keyword = self.keyword_var.get().strip()
             if not keyword or keyword not in content:
                 return
+
+            self.log(f"关键词匹配 type={mtype} sender={sender} content={content[:60]!r}")
 
             # 2) 冷却：一次命中后短时间内不再回，避免连发/重复分片
             if time.time() - self._last_auto_reply_at < 3.0:
