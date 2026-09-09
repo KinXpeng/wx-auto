@@ -1,0 +1,24 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ===== 虚拟环境（本地运行 install_dependencies.bat 自动创建）=====
+.venv/
+
+# ===== PyInstaller 构建产物 =====
+dist/
+build/
+*.spec
+
+# ===== 运行日志 =====
+wechatauto_logs/
+logs/
+
+# ===== 个人本地配置（含本机路径与个人设置，程序缺失时会用默认值并自动生成，勿提交）=====
+config.json
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.swp

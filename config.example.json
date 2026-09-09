@@ -1,0 +1,11 @@
+{
+  "db_dir": "D:\\xwechat_files",
+  "target": "目标群名或好友名",
+  "schedule_enable": true,
+  "schedule_minutes": "0.1",
+  "schedule_content": "大家好，我还在线。",
+  "keyword_enable": true,
+  "keyword": "在吗",
+  "reply_content": "该用户正忙，请稍后再试",
+  "reply_self": true
+}
