@@ -61,6 +61,8 @@ class WeChatAutoReplyApp:
         self._recent_reply_texts = set()  # 刚发出的自动回复，避免自激循环
         self._recent_sent_texts = {}  # 本程序实际发过的文本 -> 发送时间，用于识别真正的自己消息
         self._handled_keys = set()
+        self._db_lock = threading.Lock()  # 数据库连接可能被多线程复用，串行化读写
+        self._picking = False  # 会话加载中，避免重复点击
         self._patch_msg_table_lookup()
 
         self.db_dir_var = tk.StringVar(value=DEFAULT_DB_DIR)
@@ -251,63 +253,65 @@ class WeChatAutoReplyApp:
         """跨所有 message 分片拉取 sort_seq > since_seq 的新消息。"""
         from wechatauto.db import _md5_hex
 
-        db = self.db
-        target = "Msg_" + _md5_hex(user.encode())
-        rows = []
-        for rel in db._message_dbs():
-            conn = db._open(rel)
-            try:
-                exists = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                    (target,),
-                ).fetchone()
-                if not exists:
+        with self._db_lock:
+            db = self.db
+            target = "Msg_" + _md5_hex(user.encode())
+            rows = []
+            for rel in db._message_dbs():
+                conn = db._open(rel)
+                try:
+                    exists = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                        (target,),
+                    ).fetchone()
+                    if not exists:
+                        continue
+                    raw = conn.execute(
+                        f"SELECT local_id, local_type, real_sender_id, create_time, "
+                        f"message_content, source, packed_info_data, compress_content, sort_seq "
+                        f"FROM {target} WHERE sort_seq > ? ORDER BY sort_seq ASC LIMIT 200",
+                        (since_seq,),
+                    ).fetchall()
+                    for r in raw:
+                        rows.append(db._msg_row_to_dict(r))
+                except Exception as e:
+                    self.log(f"读取分片失败 {rel}: {e}")
+                finally:
+                    conn.close()
+            rows.sort(key=lambda m: m.get("sort_seq") or 0)
+            # 去重：同一 sort_seq + local_id
+            uniq = []
+            seen = set()
+            for m in rows:
+                key = (m.get("sort_seq"), m.get("local_id"), m.get("content"))
+                if key in seen:
                     continue
-                raw = conn.execute(
-                    f"SELECT local_id, local_type, real_sender_id, create_time, "
-                    f"message_content, source, packed_info_data, compress_content, sort_seq "
-                    f"FROM {target} WHERE sort_seq > ? ORDER BY sort_seq ASC LIMIT 200",
-                    (since_seq,),
-                ).fetchall()
-                for r in raw:
-                    rows.append(db._msg_row_to_dict(r))
-            except Exception as e:
-                self.log(f"读取分片失败 {rel}: {e}")
-            finally:
-                conn.close()
-        rows.sort(key=lambda m: m.get("sort_seq") or 0)
-        # 去重：同一 sort_seq + local_id
-        uniq = []
-        seen = set()
-        for m in rows:
-            key = (m.get("sort_seq"), m.get("local_id"), m.get("content"))
-            if key in seen:
-                continue
-            seen.add(key)
-            uniq.append(m)
-        return uniq
+                seen.add(key)
+                uniq.append(m)
+            return uniq
 
     def _latest_sort_seq(self, user: str) -> int:
         from wechatauto.db import _md5_hex
 
-        db = self.db
-        target = "Msg_" + _md5_hex(user.encode())
-        best = 0
-        for rel in db._message_dbs():
-            conn = db._open(rel)
-            try:
-                exists = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                    (target,),
-                ).fetchone()
-                if not exists:
-                    continue
-                mx = conn.execute(f"SELECT MAX(sort_seq) FROM {target}").fetchone()[0] or 0
-                if mx > best:
-                    best = mx
-            finally:
-                conn.close()
-        return int(best or 0)
+        with self._db_lock:
+            db = self.db
+            target = "Msg_" + _md5_hex(user.encode())
+            best = 0
+            for rel in db._message_dbs():
+                conn = db._open(rel)
+                try:
+                    exists = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                        (target,),
+                    ).fetchone()
+                    if not exists:
+                        continue
+                    mx = conn.execute(f"SELECT MAX(sort_seq) FROM {target}").fetchone()[0] or 0
+                    if mx > best:
+                        best = mx
+                finally:
+                    conn.close()
+            return int(best or 0)
 
     def detect_db(self):
         try:
@@ -369,8 +373,29 @@ class WeChatAutoReplyApp:
         return remark_or_nick or username
 
     def pick_session(self):
+        if self._picking:
+            return
+        self._picking = True
+        self.set_status("正在读取会话…")
+        threading.Thread(target=self._pick_worker, daemon=True).start()
+
+    def _pick_worker(self):
+        """后台加载会话列表，避免界面卡顿。"""
         try:
-            db = self._open_db()
+            rows = self._load_session_rows()
+            self.root.after(0, lambda rows=rows: self._show_pick_dialog(rows))
+        except Exception as e:
+            self.log(f"选择会话失败：{e}\n{traceback.format_exc()}")
+            self.root.after(0, lambda e=e: messagebox.showerror("错误", str(e)))
+        finally:
+            self._picking = False
+            self.root.after(0, lambda: self.set_status("运行中" if self.running else "未运行"))
+
+    def _load_session_rows(self):
+        if self.db is None:
+            self._open_db()  # 建立连接本身独立，不加锁
+        with self._db_lock:
+            db = self.db
             sessions = db.get_sessions(limit=80) or []
             rows = []
             for s in sessions:
@@ -383,38 +408,37 @@ class WeChatAutoReplyApp:
                 if unread:
                     label = f"{title}（未读{unread}）    [{username}]"
                 rows.append((label, title, username))
+        return rows
 
-            if not rows:
-                messagebox.showinfo("提示", "会话列表为空")
+    def _show_pick_dialog(self, rows: list):
+        if not rows:
+            messagebox.showinfo("提示", "会话列表为空")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("选择会话")
+        win.geometry("520x460")
+        win.transient(self.root)
+        win.grab_set()
+
+        ttk.Label(win, text="双击选择，或选中后点「确定」").pack(anchor=tk.W, padx=10, pady=8)
+        lb = tk.Listbox(win)
+        lb.pack(fill=tk.BOTH, expand=True, padx=10)
+        for label, _, _ in rows:
+            lb.insert(tk.END, label)
+
+        def confirm(_event=None):
+            sel = lb.curselection()
+            if not sel:
                 return
+            _, title, username = rows[sel[0]]
+            self.target_var.set(title)
+            self._resolved_user = username
+            self.log(f"已选择会话：{title} -> {username}")
+            win.destroy()
 
-            win = tk.Toplevel(self.root)
-            win.title("选择会话")
-            win.geometry("520x460")
-            win.transient(self.root)
-            win.grab_set()
-
-            ttk.Label(win, text="双击选择，或选中后点「确定」").pack(anchor=tk.W, padx=10, pady=8)
-            lb = tk.Listbox(win)
-            lb.pack(fill=tk.BOTH, expand=True, padx=10)
-            for label, _, _ in rows:
-                lb.insert(tk.END, label)
-
-            def confirm(_event=None):
-                sel = lb.curselection()
-                if not sel:
-                    return
-                _, title, username = rows[sel[0]]
-                self.target_var.set(title)
-                self._resolved_user = username
-                self.log(f"已选择会话：{title} -> {username}")
-                win.destroy()
-
-            lb.bind("<Double-Button-1>", confirm)
-            ttk.Button(win, text="确定", command=confirm).pack(pady=8)
-        except Exception as e:
-            self.log(f"选择会话失败：{e}\n{traceback.format_exc()}")
-            messagebox.showerror("错误", str(e))
+        lb.bind("<Double-Button-1>", confirm)
+        ttk.Button(win, text="确定", command=confirm).pack(pady=8)
 
     def diagnose(self):
         try:
