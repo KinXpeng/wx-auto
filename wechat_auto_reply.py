@@ -59,6 +59,7 @@ class WeChatAutoReplyApp:
         self._msg_watermark = 0
         self._last_auto_reply_at = 0.0
         self._recent_reply_texts = set()  # 刚发出的自动回复，避免自激循环
+        self._recent_sent_texts = {}  # 本程序实际发过的文本 -> 发送时间，用于识别真正的自己消息
         self._handled_keys = set()
         self._patch_msg_table_lookup()
 
@@ -501,6 +502,10 @@ class WeChatAutoReplyApp:
             text = normalize_text_content(content)
             if text:
                 self._recent_reply_texts.add(text)
+                self._recent_sent_texts[text] = time.time()
+                # 清理 5 分钟前发过的记录
+                cutoff = time.time() - 300
+                self._recent_sent_texts = {k: v for k, v in self._recent_sent_texts.items() if v > cutoff}
                 if len(self._recent_reply_texts) > 20:
                     self._recent_reply_texts = set(list(self._recent_reply_texts)[-10:])
             self._last_auto_reply_at = time.time()
@@ -512,12 +517,6 @@ class WeChatAutoReplyApp:
             mtype = str(msg.get("type") or "")
             sender = msg.get("sender_username") or ""
 
-            # 判断是否为本人发送
-            is_self = bool(self._self_wxid and sender and sender == self._self_wxid)
-            if not is_self:
-                if any(msg.get(k) for k in ("is_sender", "isSelf", "isself", "IsSender") if k in msg):
-                    is_self = True
-
             # 多媒体消息 content 不可靠，直接跳过
             if mtype in ("image", "Image", "图片", "voice", "Voice", "语音", "video", "Video", "视频", "emoji", "Emoji", "表情"):
                 return
@@ -525,6 +524,22 @@ class WeChatAutoReplyApp:
             content = normalize_text_content(str(msg.get("content") or ""))
             if not content:
                 return
+
+            # 判断是否为本人发送
+            # 注意：wechatauto 读到的某些 @ 消息会把 sender 错标成自己，所以同时参考：
+            # 1) 程序真实发过的内容；2) 消息自带的 is_sender 标记；3) sender == self_wxid 且不是 @ 开头
+            is_self_by_sender = bool(self._self_wxid and sender and sender == self._self_wxid)
+            is_self_by_flag = any(msg.get(k) for k in ("is_sender", "isSelf", "isself", "IsSender") if k in msg)
+            recent_sent_at = self._recent_sent_texts.get(content)
+            is_self_by_content = bool(recent_sent_at and time.time() - recent_sent_at < 300)
+
+            if is_self_by_content or is_self_by_flag:
+                is_self = True
+            elif is_self_by_sender and content.startswith("@"):
+                # 兼容：@ 开头的消息被错标成自己时，不当作自己消息
+                is_self = False
+            else:
+                is_self = is_self_by_sender
 
             if is_self and not self.reply_self_var.get():
                 self.log(f"忽略自己消息：{content[:40]}（sender={sender}, self={self._self_wxid}）")
@@ -612,6 +627,7 @@ class WeChatAutoReplyApp:
             self._msg_watermark = self._latest_sort_seq(user)
             self._last_auto_reply_at = 0.0
             self._recent_reply_texts.clear()
+            self._recent_sent_texts.clear()
             self._handled_keys.clear()
             self.log(f"跨分片监听已启动，水位 sort_seq={self._msg_watermark}")
         except Exception as e:
