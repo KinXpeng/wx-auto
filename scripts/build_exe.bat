@@ -27,8 +27,19 @@ echo [3/3] building WeChatAutoReply.exe ...
 "%PY%" -m PyInstaller --noconfirm --clean --onefile --windowed --name WeChatAutoReply ^
   --distpath "%ROOT%\dist" ^
   --specpath "%TMPBUILD%" --workpath "%TMPBUILD%\work" ^
-  --collect-submodules wechatauto ^
   --hidden-import win32gui ^
+  --hidden-import wechatauto.db ^
+  --hidden-import wechatauto.guia ^
+  --exclude-module cv2 ^
+  --exclude-module imageio_ffmpeg ^
+  --exclude-module pyautogui ^
+  --exclude-module pyscreeze ^
+  --exclude-module mouseinfo ^
+  --exclude-module pymsgbox ^
+  --exclude-module pygetwindow ^
+  --exclude-module pytweening ^
+  --exclude-module pyrect ^
+  --exclude-module pypinyin ^
   "%ROOT%\wechat_auto_reply.py"
 if errorlevel 1 goto fail
 
