@@ -16,13 +16,24 @@ if errorlevel 1 (
   exit /b 1
 )
 
-if not exist ".venv\Scripts\python.exe" (
+set "VENV_PY=%CD%\.venv\Scripts\python.exe"
+
+if exist "%VENV_PY%" (
+  "%VENV_PY%" -c "import sys" >nul 2>&1
+  if errorlevel 1 (
+    echo Existing .venv is invalid, recreating it ...
+    rmdir /s /q ".venv"
+  )
+)
+
+if not exist "%VENV_PY%" (
   python -m venv .venv
   if errorlevel 1 goto fail
 )
 
-.venv\Scripts\python.exe -m pip install --upgrade pip
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+"%VENV_PY%" -m pip install --upgrade pip
+if errorlevel 1 goto fail
+"%VENV_PY%" -m pip install -r requirements.txt
 if errorlevel 1 goto fail
 
 goto done

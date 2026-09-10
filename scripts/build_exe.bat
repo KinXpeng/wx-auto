@@ -15,8 +15,17 @@ if not exist "%PY%" (
   goto fail
 )
 
-rem --- pyinstaller only installed when missing, avoids repeated downloads
-if not exist "%ROOT%\.venv\Scripts\pyinstaller.exe" (
+rem --- validate the interpreter itself; a stale venv can leave python.exe present
+"%PY%" -c "import sys" >nul 2>&1
+if errorlevel 1 (
+  echo [ERROR] .venv exists but its Python interpreter is invalid.
+  echo Run install_dependencies.bat to recreate the environment.
+  goto fail
+)
+
+rem --- install PyInstaller only when the module is missing
+"%PY%" -m PyInstaller --version >nul 2>&1
+if errorlevel 1 (
   echo [1/3] installing pyinstaller into .venv ...
   "%PY%" -m pip install --quiet pyinstaller
   if errorlevel 1 goto fail
@@ -38,8 +47,9 @@ if not defined UPXDIR if defined UPX_HOME if exist "%UPX_HOME%\upx.exe" set "UPX
 rem --- restrict PATH so PyInstaller does not scan huge npm/pnpm trees
 set "SAFE_PATH=%SystemRoot%\system32;%SystemRoot%;%ROOT%\.venv\Scripts"
 set "PATH=%SAFE_PATH%"
+set "PYINSTALLER_ZLIB_COMPRESSION_LEVEL=9"
 
-set "ARGS=--noconfirm --clean --onefile --windowed --name wx-auto --distpath "%ROOT%\dist" --specpath "%TMPBUILD%" --workpath "%TMPBUILD%\work" --hidden-import win32gui --hidden-import wechatauto.db --hidden-import wechatauto.guia --exclude-module numpy --exclude-module cv2 --exclude-module imageio_ffmpeg --exclude-module pyautogui --exclude-module pyscreeze --exclude-module mouseinfo --exclude-module pymsgbox --exclude-module pygetwindow --exclude-module pytweening --exclude-module pyrect --exclude-module pypinyin --exclude-module PIL._avif --exclude-module PIL.AvifImagePlugin --exclude-module PIL._webp --exclude-module PIL.WebPImagePlugin"
+set "ARGS=--noconfirm --clean --onefile --windowed --optimize 2 --name wx-auto --distpath "%ROOT%\dist" --specpath "%TMPBUILD%" --workpath "%TMPBUILD%\work" --hidden-import win32gui --hidden-import wechatauto.db --hidden-import wechatauto.guia --hidden-import zstandard --exclude-module numpy --exclude-module cv2 --exclude-module imageio_ffmpeg --exclude-module pyautogui --exclude-module pyscreeze --exclude-module mouseinfo --exclude-module pymsgbox --exclude-module pygetwindow --exclude-module pytweening --exclude-module pyrect --exclude-module pypinyin --exclude-module PIL._avif --exclude-module PIL.AvifImagePlugin --exclude-module PIL._webp --exclude-module PIL.WebPImagePlugin"
 
 echo [3/3] building wx-auto.exe ...
 if defined UPXDIR (

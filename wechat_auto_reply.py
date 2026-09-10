@@ -52,6 +52,8 @@ class WeChatAutoReplyApp:
         self.running = False
         self.db = None
         self.worker_thread = None
+        self._stop_event = threading.Event()
+        self._closing = False
         self._last_scheduled_at = 0.0
         self._send_lock = threading.Lock()
         self._resolved_user = ""  # 监听用 username / chatroom id
@@ -63,6 +65,9 @@ class WeChatAutoReplyApp:
         self._handled_keys = set()
         self._db_lock = threading.Lock()  # 数据库连接可能被多线程复用，串行化读写
         self._picking = False  # 会话加载中，避免重复点击
+        self._runtime_lock = threading.Lock()
+        self._runtime_config = {}
+        self._runtime_sync_id = None
         self._patch_msg_table_lookup()
 
         self.db_dir_var = tk.StringVar(value=DEFAULT_DB_DIR)
@@ -76,6 +81,10 @@ class WeChatAutoReplyApp:
 
         self._build_ui()
         self._load_config()
+        self._capture_runtime_config()
+        self._runtime_sync_id = None
+        self._runtime_sync_pending = False
+        self._watch_runtime_config()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build_ui(self):
@@ -145,7 +154,79 @@ class WeChatAutoReplyApp:
         )
         ttk.Label(frm, text=tip, foreground="#666666", wraplength=540).pack(anchor=tk.W, pady=(8, 0))
 
+    def _read_ui_config(self) -> dict:
+        """只在 Tk 主线程读取控件，后台线程使用配置快照。"""
+        return {
+            "db_dir": self.db_dir_var.get().strip(),
+            "target": self.target_var.get().strip(),
+            "schedule_enable": self.schedule_enable_var.get(),
+            "schedule_minutes": self.schedule_minutes_var.get().strip(),
+            "schedule_content": self.schedule_text.get("1.0", tk.END).strip(),
+            "keyword_enable": self.keyword_enable_var.get(),
+            "keyword": self.keyword_var.get().strip(),
+            "reply_content": self.reply_text.get("1.0", tk.END).strip(),
+            "reply_self": self.reply_self_var.get(),
+        }
+
+    def _capture_runtime_config(self) -> dict:
+        data = self._read_ui_config()
+        with self._runtime_lock:
+            self._runtime_config = data
+        return data
+
+    def _runtime_snapshot(self) -> dict:
+        with self._runtime_lock:
+            return dict(self._runtime_config)
+
+    def _watch_runtime_config(self):
+        """用事件驱动更新配置快照：Variable 用 trace，多行文本用 <KeyRelease>，
+        外加低频兜底轮询（只在本机未改动时为空操作），避免 250ms 空转。"""
+        traceable = (
+            self.db_dir_var,
+            self.target_var,
+            self.schedule_enable_var,
+            self.schedule_minutes_var,
+            self.keyword_enable_var,
+            self.keyword_var,
+            self.reply_self_var,
+        )
+        for v in traceable:
+            v.trace_add("write", self._queue_runtime_sync)
+        for w in (self.schedule_text, self.reply_text):
+            w.bind("<KeyRelease>", self._queue_runtime_sync)
+        self._runtime_sync_id = self.root.after(1000, self._sync_runtime_config)
+
+    def _queue_runtime_sync(self, *_args):
+        if self._closing or self._runtime_sync_pending:
+            return
+        self._runtime_sync_pending = True
+        if self._runtime_sync_id is not None:
+            try:
+                self.root.after_cancel(self._runtime_sync_id)
+            except tk.TclError:
+                pass
+        self._runtime_sync_id = self.root.after(60, self._sync_runtime_config)
+
+    def _sync_runtime_config(self):
+        self._runtime_sync_id = None
+        self._runtime_sync_pending = False
+        if self._closing:
+            return
+        try:
+            self._capture_runtime_config()
+        except tk.TclError:
+            self._runtime_sync_id = None
+            return
+        # 兜底：仅当没有任何用户改动事件时保持低频扫描，成本极低
+        if not self._runtime_sync_pending:
+            try:
+                self._runtime_sync_id = self.root.after(750, self._sync_runtime_config)
+            except tk.TclError:
+                self._runtime_sync_id = None
+
     def log(self, msg: str):
+        if self._closing:
+            return
         line = f"[{now_str()}] {msg}\n"
 
         def _append():
@@ -157,6 +238,8 @@ class WeChatAutoReplyApp:
         self.root.after(0, _append)
 
     def set_status(self, text: str):
+        if self._closing:
+            return
         self.root.after(0, lambda: self.status_var.set(text))
 
     def _load_config(self):
@@ -179,18 +262,19 @@ class WeChatAutoReplyApp:
             self.log(f"读取配置失败：{e}")
 
     def _save_config(self):
-        data = {
-            "db_dir": self.db_dir_var.get().strip(),
-            "target": self.target_var.get().strip(),
-            "schedule_enable": self.schedule_enable_var.get(),
-            "schedule_minutes": self.schedule_minutes_var.get().strip(),
-            "schedule_content": self.schedule_text.get("1.0", tk.END).strip(),
-            "keyword_enable": self.keyword_enable_var.get(),
-            "keyword": self.keyword_var.get().strip(),
-            "reply_content": self.reply_text.get("1.0", tk.END).strip(),
-            "reply_self": self.reply_self_var.get(),
-        }
-        CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        data = self._read_ui_config()
+        # 先写临时文件再原子替换，避免写入中断时 config.json 被截断/损坏
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+        tmp = CONFIG_PATH.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(CONFIG_PATH)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except Exception:
+                    pass
 
     @staticmethod
     def _patch_msg_table_lookup():
@@ -225,13 +309,17 @@ class WeChatAutoReplyApp:
         WeChatDB._find_msg_table = _find_msg_table
         WeChatDB._multi_shard_patched = True
 
-    def _open_db(self):
+    def _open_db(self, db_dir: str | None = None):
         from wechatauto import WeChatDB, list_accounts
         from wechatauto.db import auto_detect_db_dir
 
         self._patch_msg_table_lookup()
-        db_dir = self.db_dir_var.get().strip() or auto_detect_db_dir() or DEFAULT_DB_DIR
-        self.db_dir_var.set(db_dir)
+        if db_dir is None:
+            if threading.current_thread() is threading.main_thread():
+                db_dir = self._read_ui_config()["db_dir"]
+            else:
+                db_dir = self._runtime_snapshot()["db_dir"]
+        db_dir = db_dir.strip() or auto_detect_db_dir() or DEFAULT_DB_DIR
         accounts = list_accounts(db_dir)
         if not accounts:
             raise RuntimeError(f"在目录中未找到微信账号数据：{db_dir}")
@@ -534,16 +622,17 @@ class WeChatAutoReplyApp:
             messagebox.showinfo("提示", "已经在运行中")
             return
 
-        target = strip_member_count(self.target_var.get())
+        config = self._capture_runtime_config()
+        target = strip_member_count(config["target"])
         if not target:
             messagebox.showwarning("提示", "请先填写或选择目标会话")
             return
-        if self.keyword_enable_var.get() and not self.keyword_var.get().strip():
+        if config["keyword_enable"] and not config["keyword"]:
             messagebox.showwarning("提示", "已启用关键词回复，请填写触发关键词")
             return
-        if self.schedule_enable_var.get():
+        if config["schedule_enable"]:
             try:
-                minutes = float(self.schedule_minutes_var.get().strip())
+                minutes = float(config["schedule_minutes"])
                 if minutes <= 0:
                     raise ValueError
             except ValueError:
@@ -551,24 +640,45 @@ class WeChatAutoReplyApp:
                 return
 
         self._save_config()
+        self._stop_event.clear()
         self.running = True
         self._last_scheduled_at = time.time()
         self.set_status("运行中")
         self.log(f"启动中，目标会话：{target}")
-        self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.worker_thread = threading.Thread(
+            target=self._worker_loop, args=(config,), daemon=True
+        )
         self.worker_thread.start()
 
-    def stop(self):
+    def _request_stop(self):
         self.running = False
+        self._stop_event.set()
+
+    def stop(self):
+        self._request_stop()
+        thread = self.worker_thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2)
         self.set_status("已停止")
         self.log("已停止")
 
     def on_close(self):
-        self.running = False
+        self._closing = True
+        self._request_stop()
+        if self._runtime_sync_id is not None:
+            try:
+                self.root.after_cancel(self._runtime_sync_id)
+            except tk.TclError:
+                pass
+            self._runtime_sync_id = None
         try:
             self._save_config()
         except Exception:
             pass
+        # 等后台线程退出后再销毁主界面，避免 Tk 对象被后台线程访问
+        thread = self.worker_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=3)
         self.root.destroy()
 
     def _send_text(self, who_display: str, content: str):
@@ -596,8 +706,9 @@ class WeChatAutoReplyApp:
                     self._recent_reply_texts = set(list(self._recent_reply_texts)[-10:])
             self._last_auto_reply_at = time.time()
 
-    def _handle_message(self, msg: dict):
-        if not self.running or not self.keyword_enable_var.get():
+    def _handle_message(self, msg: dict, who_display: str):
+        config = self._runtime_snapshot()
+        if not self.running or not config["keyword_enable"]:
             return
         try:
             mtype = str(msg.get("type") or "")
@@ -627,7 +738,7 @@ class WeChatAutoReplyApp:
             else:
                 is_self = is_self_by_sender
 
-            if is_self and not self.reply_self_var.get():
+            if is_self and not config["reply_self"]:
                 self.log(f"忽略自己消息：{content[:40]}（sender={sender}, self={self._self_wxid}）")
                 return
 
@@ -635,7 +746,7 @@ class WeChatAutoReplyApp:
             if mtype and mtype not in ("文本", "text", "Text", "1", "appmsg", "App", "49"):
                 self.log(f"收到非文本消息 type={mtype} sender={sender} content={content[:60]!r}")
 
-            reply = self.reply_text.get("1.0", tk.END).strip()
+            reply = config["reply_content"]
             reply_norm = normalize_text_content(reply)
 
             # 1) 忽略自动回复正文本身（即使勾了响应自己）
@@ -644,7 +755,7 @@ class WeChatAutoReplyApp:
             if content in self._recent_reply_texts:
                 return
 
-            keyword = self.keyword_var.get().strip()
+            keyword = config["keyword"]
             if not keyword or keyword not in content:
                 return
 
@@ -666,26 +777,18 @@ class WeChatAutoReplyApp:
             if not reply:
                 return
 
-            who_display = strip_member_count(self.target_var.get())
             self.log(f"命中关键词「{keyword}」← {content[:80]}")
             self._send_text(who_display, reply)
             self.log(f"已自动回复 → {reply[:80]}")
-
-            # 发出后短暂抬高水位，减少立刻又读到自己刚发的消息
-            try:
-                seq = int(msg.get("sort_seq") or 0)
-                if seq > self._msg_watermark:
-                    self._msg_watermark = seq
-            except Exception:
-                pass
         except Exception as e:
             self.log(f"处理消息失败：{e}\n{traceback.format_exc()}")
 
     def _maybe_schedule_send(self, who_display: str):
-        if not self.schedule_enable_var.get():
+        config = self._runtime_snapshot()
+        if not config["schedule_enable"]:
             return
         try:
-            minutes = float(self.schedule_minutes_var.get().strip() or "0")
+            minutes = float(config["schedule_minutes"] or "0")
         except ValueError:
             return
         if minutes <= 0:
@@ -693,20 +796,21 @@ class WeChatAutoReplyApp:
         now = time.time()
         if now - self._last_scheduled_at < minutes * 60:
             return
-        content = self.schedule_text.get("1.0", tk.END).strip()
+        content = config["schedule_content"]
         if not content:
             return
         self._send_text(who_display, content)
         self._last_scheduled_at = now
         self.log(f"定时发送 → {content[:80]}")
 
-    def _worker_loop(self):
-        who_display = strip_member_count(self.target_var.get())
+    def _worker_loop(self, config: dict):
+        who_display = strip_member_count(config["target"])
         try:
-            self._open_db()
+            self._open_db(config["db_dir"])
             user, show = self.resolve_target(who_display)
             self._resolved_user = user
-            self.target_var.set(show)
+            if not self._closing:
+                self.root.after(0, lambda show=show: self.target_var.set(show))
             self.log(f"监听对象已解析：{show} -> {user}")
 
             # 从跨分片最新位置开始，避免读到旧分片导致永远收不到新消息
@@ -723,7 +827,7 @@ class WeChatAutoReplyApp:
             return
 
         try:
-            while self.running:
+            while self.running and not self._stop_event.is_set():
                 try:
                     new_msgs = self._collect_new_messages(user, self._msg_watermark)
                     if new_msgs:
@@ -732,11 +836,11 @@ class WeChatAutoReplyApp:
                             max(int(m.get("sort_seq") or 0) for m in new_msgs),
                         )
                         for msg in new_msgs:
-                            self._handle_message(msg)
+                            self._handle_message(msg, show)
                     self._maybe_schedule_send(show)
                 except Exception as e:
                     self.log(f"轮询异常：{e}")
-                time.sleep(1.0)
+                self._stop_event.wait(1.0)
         finally:
             self.set_status("已停止")
             self.log("工作线程结束")
