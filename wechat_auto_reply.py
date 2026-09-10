@@ -24,6 +24,24 @@ if getattr(sys, "frozen", False):
     CONFIG_PATH = Path(sys.executable).with_name("config.json")
 DEFAULT_DB_DIR = r"D:\xwechat_files"
 
+# ===== UI 主题令牌 =====
+C_BG = "#F5F6F7"          # 界面主背景
+C_CARD = "#FFFFFF"        # 卡片面板底色
+C_BORDER = "#E3E6EA"     # 卡片/分隔线
+C_TEXT = "#1F2329"        # 主文字
+C_SUBTEXT = "#8A919F"     # 次级文字
+C_GREEN = "#07C160"       # 微信绿：启动/运行中
+C_GREEN_DK = "#059B4C"    # 启动按钮 hover/按下
+C_GRAY = "#B7BDC7"       # 停止/未运行
+C_RED = "#FA5151"         # 错误/失败
+C_ACCENT_BG = "#E8F7EF"   # 绿色卡片底色（运行状态）
+C_ACCENT_BG_RED = "#FDECEC"  # 红色卡片底色（错误）
+FONT = ("Microsoft YaHei UI", 10)
+FONT_BOLD = ("Microsoft YaHei UI", 10, "bold")
+FONT_TITLE = ("Microsoft YaHei UI", 12, "bold")
+FONT_TAG = ("Microsoft YaHei UI", 9)
+FONT_MONO = ("Consolas", 10)
+
 
 def now_str() -> str:
     return datetime.now().strftime("%H:%M:%S")
@@ -45,9 +63,9 @@ def normalize_text_content(content: str) -> str:
 class WeChatAutoReplyApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("微信自动回复（微信4.x）")
-        self.root.geometry("580x680")
-        self.root.minsize(540, 600)
+        self.root.title("微信自动回复 · 微信 4.x")
+        self.root.geometry("600x720")
+        self.root.minsize(560, 660)
 
         self.running = False
         self.db = None
@@ -79,80 +97,166 @@ class WeChatAutoReplyApp:
         self.reply_self_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="未运行")
 
+        self._configure_style()
+        self._dot = None
+        self._dot_win = None
         self._build_ui()
         self._load_config()
         self._capture_runtime_config()
         self._runtime_sync_id = None
         self._runtime_sync_pending = False
         self._watch_runtime_config()
+        self._apply_status_visual("未运行")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
+    def _configure_style(self):
+        """应用自定义 ttk 主题/样式，让界面在新旧 Windows 上保持一致观感。"""
+        try:
+            import tkinter.font as tkfont
+
+            for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
+                try:
+                    tkfont.nametofont(name).configure(family="Microsoft YaHei UI", size=10)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            style = ttk.Style(self.root)
+            # 兼容系统里可用的圆角现代主题；失败则退回默认
+            for theme in ("vista", "xpnative"):
+                if theme in style.theme_names():
+                    style.theme_use(theme)
+                    break
+            style.configure("TFrame", background=C_BG)
+            style.configure("TLabel", background=C_BG, foreground=C_TEXT, font=FONT)
+            style.configure("TEntry", padding=5, fieldbackground=C_CARD, borderwidth=1)
+            style.configure("TCheckbutton", background=C_BG, foreground=C_TEXT, font=FONT)
+            style.configure(
+                "TLabelframe",
+                background=C_BG,
+                bordercolor=C_BORDER,
+                lightcolor=C_BORDER,
+                darkcolor=C_BORDER,
+            )
+            style.configure("TLabelframe.Label", background=C_BG, foreground=C_SUBTEXT, font=FONT_BOLD)
+            # 主按钮：用绿色粗体文字 + 适度内边距，任何主题下都清晰可读
+            style.configure("Accent.TButton", font=FONT_BOLD, foreground=C_GREEN, padding=(10, 4))
+            style.configure("TButton", font=FONT, padding=(8, 4))
+        except Exception:
+            pass
+
     def _build_ui(self):
-        pad = {"padx": 12, "pady": 6}
-        frm = ttk.Frame(self.root, padding=10)
-        frm.pack(fill=tk.BOTH, expand=True)
+        root_bg = C_BG
+        self.root.configure(bg=root_bg)
 
-        ttk.Label(frm, text="微信数据目录（xwechat_files）").pack(anchor=tk.W)
-        db_row = ttk.Frame(frm)
-        db_row.pack(fill=tk.X, **pad)
+        outer = tk.Frame(self.root, bg=root_bg)
+        outer.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
+
+        # ==== 顶部：标题 + 运行状态徽标 ====
+        header = tk.Frame(outer, bg=root_bg)
+        header.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(header, text="微信自动回复", font=FONT_TITLE, bg=root_bg, fg=C_TEXT).pack(side=tk.LEFT)
+        status_box = tk.Frame(header, bg=root_bg)
+        status_box.pack(side=tk.RIGHT)
+        self._status_box = status_box
+        self._dot_win = tk.Canvas(status_box, width=16, height=16, bg=root_bg, highlightthickness=0)
+        self._dot = self._dot_win.create_oval(3, 3, 13, 13, fill=C_GRAY, outline="")
+        self._dot_win.pack(side=tk.LEFT, padx=(0, 5))
+        self.status_label = tk.Label(
+            status_box, textvariable=self.status_var, bg=root_bg, fg=C_SUBTEXT, font=FONT
+        )
+        self.status_label.pack(side=tk.LEFT)
+
+        def _row_label(parent, text):
+            tk.Label(parent, text=text, bg=root_bg, fg=C_SUBTEXT, font=FONT_TAG).pack(
+                anchor="w", pady=(0, 3))
+            return parent
+
+        # ==== 数据目录 ====
+        _row_label(outer, "微信数据目录")
+        db_row = tk.Frame(outer, bg=root_bg)
+        db_row.pack(fill=tk.X, pady=(0, 8))
         ttk.Entry(db_row, textvariable=self.db_dir_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(db_row, text="检测", width=8, command=self.detect_db).pack(side=tk.LEFT, padx=(8, 0))
-
-        ttk.Label(frm, text="目标会话（群名 / 备注 / 昵称，不要带人数）").pack(anchor=tk.W)
-        target_row = ttk.Frame(frm)
-        target_row.pack(fill=tk.X, **pad)
-        ttk.Entry(target_row, textvariable=self.target_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(target_row, text="选择会话", width=10, command=self.pick_session).pack(
+        ttk.Button(db_row, text="检测", width=7, command=self.detect_db).pack(
             side=tk.LEFT, padx=(8, 0)
         )
 
-        schedule_box = ttk.LabelFrame(frm, text="定时自动发送", padding=10)
-        schedule_box.pack(fill=tk.X, **pad)
-        row1 = ttk.Frame(schedule_box)
+        # ==== 目标会话 ====
+        _row_label(outer, "目标会话（群名/好友备注/昵称）")
+        tgt_row = tk.Frame(outer, bg=root_bg)
+        tgt_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Entry(tgt_row, textvariable=self.target_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(tgt_row, text="选择会话", width=9, command=self.pick_session).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+
+        # ==== 定时自动发送 ====
+        _row_label(outer, "定时自动发送")
+        row1 = tk.Frame(outer, bg=root_bg)
         row1.pack(fill=tk.X)
         ttk.Checkbutton(row1, text="启用：每隔", variable=self.schedule_enable_var).pack(side=tk.LEFT)
         ttk.Entry(row1, textvariable=self.schedule_minutes_var, width=5).pack(side=tk.LEFT, padx=4)
-        ttk.Label(row1, text="分钟，自动发一条消息").pack(side=tk.LEFT)
-        ttk.Label(schedule_box, text="定时发送内容").pack(anchor=tk.W, pady=(8, 2))
-        self.schedule_text = scrolledtext.ScrolledText(schedule_box, height=3, wrap=tk.WORD)
-        self.schedule_text.pack(fill=tk.X)
+        ttk.Label(row1, text="分钟发一条").pack(side=tk.LEFT)
+        self.schedule_text = scrolledtext.ScrolledText(
+            outer, height=2, wrap=tk.WORD, font=FONT_MONO,
+            bg=C_CARD, fg=C_TEXT, insertbackground=C_TEXT, relief="solid", bd=1
+        )
+        self.schedule_text.pack(fill=tk.X, pady=(4, 8))
         self.schedule_text.insert(tk.END, "大家好，我还在线。")
 
-        keyword_box = ttk.LabelFrame(frm, text="关键词自动回复", padding=10)
-        keyword_box.pack(fill=tk.X, **pad)
+        # ==== 关键词自动回复 ====
+        _row_label(outer, "关键词自动回复")
         ttk.Checkbutton(
-            keyword_box,
-            text="启用：收到包含关键词的消息后自动回复",
-            variable=self.keyword_enable_var,
-        ).pack(anchor=tk.W)
-        ttk.Label(keyword_box, text="触发关键词").pack(anchor=tk.W, pady=(8, 2))
-        ttk.Entry(keyword_box, textvariable=self.keyword_var).pack(fill=tk.X)
-        ttk.Label(keyword_box, text="自动回复内容").pack(anchor=tk.W, pady=(8, 2))
-        self.reply_text = scrolledtext.ScrolledText(keyword_box, height=3, wrap=tk.WORD)
-        self.reply_text.pack(fill=tk.X)
+            outer, text="启用：收到包含关键词的消息后自动回复", variable=self.keyword_enable_var
+        ).pack(anchor="w")
+        kw = tk.Frame(outer, bg=root_bg)
+        kw.pack(fill=tk.X, pady=(6, 0))
+        tk.Label(kw, text="触发关键词", bg=root_bg, fg=C_SUBTEXT, font=FONT_TAG).pack(
+            anchor="w", pady=(0, 2))
+        self.keyword_entry = ttk.Entry(kw, textvariable=self.keyword_var)
+        self.keyword_entry.pack(fill="x")
+        tk.Label(kw, text="自动回复内容", bg=root_bg, fg=C_SUBTEXT, font=FONT_TAG).pack(
+            anchor="w", pady=(8, 2))
+        self.reply_text = scrolledtext.ScrolledText(
+            kw, height=2, wrap=tk.WORD, font=FONT_MONO, bg=C_CARD, fg=C_TEXT, bd=1, relief="solid"
+        )
+        self.reply_text.pack(fill="x")
         self.reply_text.insert(tk.END, "该用户正忙，请稍后再试")
         ttk.Checkbutton(
-            keyword_box,
-            text="响应自己发的消息（自测用；正常请关闭。回复内容勿包含关键词）",
-            variable=self.reply_self_var,
-        ).pack(anchor=tk.W, pady=(8, 0))
+            kw, text="响应自己发的消息（自测用；回复内容勿包含关键词）", variable=self.reply_self_var
+        ).pack(anchor="w", pady=(6, 0))
 
-        btn_row = ttk.Frame(frm)
-        btn_row.pack(fill=tk.X, pady=8)
-        ttk.Button(btn_row, text="启动", command=self.start).pack(side=tk.LEFT)
-        ttk.Button(btn_row, text="停止", command=self.stop).pack(side=tk.LEFT, padx=8)
-        ttk.Button(btn_row, text="诊断", command=self.diagnose).pack(side=tk.LEFT)
-        ttk.Label(btn_row, textvariable=self.status_var).pack(side=tk.RIGHT)
+        # ==== 操作区 ====
+        action_box = tk.Frame(outer, bg=root_bg)
+        action_box.pack(fill=tk.X, pady=(12, 8))
+        ttk.Button(action_box, text="启动", style="Accent.TButton", command=self.start).pack(side=tk.LEFT)
+        ttk.Button(action_box, text="停止", command=self.stop).pack(side=tk.LEFT, padx=8)
+        ttk.Button(action_box, text="诊断", command=self.diagnose).pack(side=tk.LEFT)
 
-        ttk.Label(frm, text="运行日志").pack(anchor=tk.W)
-        self.log_box = scrolledtext.ScrolledText(frm, height=12, wrap=tk.WORD, state=tk.DISABLED)
-        self.log_box.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
-
-        tip = (
-            "适配微信 4.x（Weixin）。请保持微信已登录；发送时不要锁屏。"
-            "群名请填 MayDearBeeSure，不要填 MayDearBeeSure (27)。"
+        # ==== 日志 ====
+        _row_label(outer, "运行日志")
+        self.log_box = scrolledtext.ScrolledText(
+            outer, height=7, wrap=tk.WORD, state=tk.DISABLED, font=FONT_MONO,
+            bg=C_CARD, fg=C_TEXT, bd=1, relief="solid"
         )
-        ttk.Label(frm, text=tip, foreground="#666666", wraplength=540).pack(anchor=tk.W, pady=(8, 0))
+        self.log_box.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        tip = ("适配微信 4.x，请保持微信已登录，发送时不要锁屏。"
+               "群名请填实际的群名/昵称，不要带末尾的人数括号。")
+        tk.Label(outer, text=tip, bg=root_bg, fg=C_SUBTEXT, font=FONT_TAG, justify="left").pack(anchor="w")
+
+    def _apply_status_visual(self, text: str | None = None):
+        text = text or self.status_var.get()
+        color = C_GRAY
+        if "运行中" in text:
+            color = C_GREEN
+        elif "失败" in text or "错误" in text:
+            color = C_RED
+        try:
+            self._dot_win.itemconfig(self._dot, fill=color)
+        except Exception:
+            pass
 
     def _read_ui_config(self) -> dict:
         """只在 Tk 主线程读取控件，后台线程使用配置快照。"""
@@ -240,7 +344,12 @@ class WeChatAutoReplyApp:
     def set_status(self, text: str):
         if self._closing:
             return
-        self.root.after(0, lambda: self.status_var.set(text))
+
+        def _set(self=self, text=text):
+            self.status_var.set(text)
+            self._apply_status_visual(text)
+
+        self.root.after(0, _set)
 
     def _load_config(self):
         if not CONFIG_PATH.exists():
@@ -848,12 +957,6 @@ class WeChatAutoReplyApp:
 
 def main():
     root = tk.Tk()
-    try:
-        style = ttk.Style()
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-    except Exception:
-        pass
     WeChatAutoReplyApp(root)
     root.mainloop()
 
